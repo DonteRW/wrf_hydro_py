@@ -3,12 +3,17 @@ import os
 import pathlib
 import pickle
 import warnings
+import shutil
 from typing import Union
 
 import pandas as pd
 
 from .domain import Domain
-from .ioutils import WrfHydroStatic, WrfHydroTs, check_input_files, check_file_nas
+from .ioutils import WrfHydroStatic, \
+    WrfHydroTs, \
+    check_input_files, \
+    check_file_nas, \
+    sort_files_by_time
 from .job import Job
 from .model import Model
 from .namelist import Namelist
@@ -22,7 +27,7 @@ class Simulation(object):
     """
 
     def __init__(self):
-        """Instantiates a WrfHydroSetup object"""
+        """Instantiates a Simulation object"""
 
         # Public attributes
         self.model = None
@@ -53,42 +58,56 @@ class Simulation(object):
             self._addmodel(obj)
         elif isinstance(obj, Domain):
             self._adddomain(obj)
-        elif issubclass(type(obj),Scheduler):
+        elif issubclass(type(obj), Scheduler):
             self._addscheduler(obj)
-        elif isinstance(obj,Job):
+        elif isinstance(obj, Job):
             self._addjob(obj)
         else:
             raise TypeError('obj is not of a type expected for a Simulation')
 
-    def compose(self, symlink_domain: bool = True, force: bool = False):
+    def compose(
+        self,
+        symlink_domain: bool=True,
+        force: bool=False,
+        check_nlst_warn: bool=False
+    ):
         """Compose simulation directories and files
         Args:
             symlink_domain: Symlink the domain files rather than copy
             force: Compose into directory even if not empty. This is considered bad practice but
             is necessary in certain circumstances.
+            check_nlst_warn: Allow the namelist checking/validation to only result in warnings.
+            This is also not great practice, but necessary in certain circumstances.
         """
 
         print("Composing simulation into directory:'" + os.getcwd() + "'")
-        #Check that the current directory is empty
+        # Check that the current directory is empty
         current_dir = pathlib.Path(os.getcwd())
         current_dir_files = list(current_dir.rglob('*'))
         if len(current_dir_files) > 0 and force is False:
-            raise FileExistsError('Unable to compose, current working directory is not empty. '
+            raise FileExistsError('Unable to compose, current working directory is not empty and '
+                                  'force is False. '
                                   'Change working directory to an empty directory with os.chdir()')
 
         # Symlink in domain files
         print('Getting domain files...')
-        self.domain.copy_files(dest_dir=os.getcwd(),symlink=symlink_domain)
+        self.domain.copy_files(dest_dir=os.getcwd(), symlink=symlink_domain)
 
         # Update job objects and make job directories
         print('Making job directories...')
         for job in self.jobs:
             job._make_job_dir()
-            job._write_namelists() # write namelists
+            job._write_namelists()  # write namelists
+
+        # If the first job is a restart, set the model end time.
+        if self.jobs[0].restart:
+            file_model_end_time = current_dir / '.model_end_time'
+            with file_model_end_time.open('w') as opened_file:
+                _ = opened_file.write(str(self.jobs[0]._model_start_time))
 
         # Validate jobs
         print('Validating job input files')
-        self._validate_jobs()
+        self._validate_jobs(check_nlst_warn=check_nlst_warn)
 
         # Compile model or copy files
         if self.model.compile_log is not None:
@@ -100,6 +119,12 @@ class Simulation(object):
         else:
             print('Compiling model...')
             self.model.compile(compile_dir=os.getcwd())
+
+        # Make copies for each TBL file (never symlink)
+        for from_file in self.model.table_files:
+            from_file = pathlib.Path(from_file)
+            to_file = current_dir.joinpath(from_file.name)
+            shutil.copy(str(from_file), str(to_file))
 
         print('Simulation successfully composed')
 
@@ -128,12 +153,12 @@ class Simulation(object):
         current_dir = pathlib.Path(os.curdir).absolute()
 
         # Overwrite sim job objects with collected objects matched on job id
-        ## Create dict of index/ids so that globbed jobs match the original list order
+        # Create dict of index/ids so that globbed jobs match the original list order
         id_index = dict()
         for index, item in enumerate(self.jobs):
             id_index[item.job_id] = index
 
-        ## Insert collect jobs into sim job list
+        # Insert collect jobs into sim job list
         job_objs = current_dir.rglob('WrfHydroJob_postrun.pkl')
         for job_obj in job_objs:
             collect_job = pickle.load(job_obj.open(mode='rb'))
@@ -143,7 +168,7 @@ class Simulation(object):
         self.output = SimulationOutput()
         self.output.collect_output(sim_dir=os.getcwd())
 
-    def pickle(self,path: str):
+    def pickle(self, path: str):
         """Pickle sim object to specified file path
         Args:
             path: The file path for pickle
@@ -151,6 +176,41 @@ class Simulation(object):
         path = pathlib.Path(path)
         with path.open(mode='wb') as f:
             pickle.dump(self, f, 2)
+
+    def pickle_sub_obj(
+        self,
+        sub_obj,
+        path
+    ):
+        """
+        Method to reduce *composed* simulation pickle sizes for performance applications. This
+        method replaces a simulation sub-object (model, domain, or output)  with it's relative
+        pathlib.Path. The inverse, to bring that object back from its path is restore_obj().
+        Usage example: 
+            sim.model = sim.pickle_sub_obj(sim.model, 'WrfHydroModel.pkl')
+        """
+        path = pathlib.Path(path)
+        with path.open(mode='wb') as f:
+            pickle.dump(sub_obj, f, 2)
+        return path
+
+    def restore_sub_obj(
+        self,
+        attr_name: pathlib.Path
+    ):
+        """
+        Method to reduce *composed* simulation pickle sizes for performance applications. This
+        method restores a simulation sub-object (model, domain, or output) from it's relative
+        pathlib.Path, which replaces the object in the simulation. The inverse, that pickles the
+        subobject is pickle_sub_obj().
+        Usage: 
+            sim.model = sim.restore_obj('model')
+        """
+        #the_attr = getattr(self, attr_name)
+        #if not isinstance(the_attr, pathlib.Path):
+        #    raise ValueError("Can only restore attributes which are pathlib.Path objects.")
+        #setattr(self, attr_name, pickle.load(open(the_attr, "rb")))
+        return pickle.load(attr_name.open(mode="rb"))
 
     # Private methods
     def _validate_model_domain(self, model, domain):
@@ -167,13 +227,19 @@ class Simulation(object):
                             domain.compatible_version)
         elif model.version != domain.compatible_version:
             warnings.warn('Model minor versions ' +
-                            model.version +
-                            ' do not match domain minor versions ' +
-                            domain.compatible_version)
+                          model.version +
+                          ' do not match domain minor versions ' +
+                          domain.compatible_version)
 
-
-    def _validate_jobs(self):
-        """Private method to check that all files are present for each job"""
+    def _validate_jobs(
+        self,
+        check_nlst_warn: bool=False
+    ):
+        """Private method to check that all files are present for each job.
+        Args:
+            check_nlst_warn: Allow the namelist checking/validation to only result in warnings.
+            This is also not great practice, but necessary in certain circumstances.
+        """
         counter = 0
         for job in self.jobs:
             counter += 1
@@ -183,10 +249,13 @@ class Simulation(object):
             else:
                 ignore_restarts = True
 
-            check_input_files(hrldas_namelist=job.hrldas_namelist,
-                              hydro_namelist=job.hydro_namelist,
-                              sim_dir=os.getcwd(),
-                              ignore_restarts=ignore_restarts)
+            check_input_files(
+                hrldas_namelist=job.hrldas_namelist,
+                hydro_namelist=job.hydro_namelist,
+                sim_dir=os.getcwd(),
+                ignore_restarts=ignore_restarts,
+                check_nlst_warn=check_nlst_warn
+            )
 
     def _set_base_namelists(self):
         """Private method to create the base namelists which are added to each Job. The Job then
@@ -211,7 +280,7 @@ class Simulation(object):
             self._validate_model_domain(model, self.domain)
 
             # Add in model
-            self.model = copy.deepcopy(model)
+            self.model = model
 
             # Setup base namelists
             self._set_base_namelists()
@@ -265,12 +334,18 @@ class SimulationOutput(object):
     def __init__(self):
         self.channel_rt = None
         """WrfHydroTs: Timeseries dataset of CHRTOUT files"""
+        self.channel_rt_grid = None
+        """WrfHydroTs: Timeseries dataset of CHRTOUT gridded files"""
         self.chanobs = None
         """WrfHydroTs: Timeseries dataset of CHANOBS files"""
         self.lakeout = None
         """WrfHydroTs: Timeseries dataset of LAKEOUT files"""
         self.gwout = None
         """WrfHydroTs: Timeseries dataset of GWOUT files"""
+        self.rtout = None
+        """WrfHydroTs: Timeseries dataset of RTOUT files"""
+        self.ldasout = None
+        """WrfHydroTs: Timeseries dataset of LDASOUT files"""
         self.restart_hydro = None
         """list: List of HYDRO_RST WrfHydroStatic objects"""
         self.restart_lsm = None
@@ -278,71 +353,88 @@ class SimulationOutput(object):
         self.restart_nudging = None
         """list: List of nudgingLastObs WrfHydroStatic objects"""
 
-    def collect_output(self,sim_dir: Union[str,pathlib.Path]):
+    def collect_output(self, sim_dir: Union[str, pathlib.Path] = None):
         """Collect simulation output after a run
         Args:
-            sim_dir: The simulation directory
+            sim_dir: The simulation directory to collect
         """
 
-        current_dir = pathlib.Path(os.curdir).absolute()
+        if sim_dir is None:
+            sim_dir = pathlib.Path(os.curdir).absolute()
+        else:
+            sim_dir = pathlib.Path(sim_dir).absolute()
 
         # Grab outputs as WrfHydroXX classes of file paths
         # Get channel files
-        if len(list(current_dir.glob('*CHRTOUT*'))) > 0:
-            self.channel_rt = WrfHydroTs(list(current_dir.glob('*CHRTOUT*')))
+        if len(list(sim_dir.glob('*CHRTOUT_DOMAIN*'))) > 0:
+            self.channel_rt = sort_files_by_time(list(sim_dir.glob('*CHRTOUT_DOMAIN*')))
+            self.channel_rt = WrfHydroTs(self.channel_rt)
 
-        if len(list(current_dir.glob('*CHANOBS*'))) > 0:
-            self.chanobs = WrfHydroTs(list(current_dir.glob('*CHANOBS*')))
-            # Make relative to run dir
-            # for file in self.chanobs:
-            #     file.relative_to(file.parent)
+        if len(list(sim_dir.glob('*CHRTOUT_GRID*'))) > 0:
+            self.channel_rt_grid = sort_files_by_time(list(sim_dir.glob('*CHRTOUT_GRID*')))
+            self.channel_rt_grid = WrfHydroTs(self.channel_rt_grid)
+
+        if len(list(sim_dir.glob('*CHANOBS*'))) > 0:
+            self.chanobs = sort_files_by_time(list(sim_dir.glob('*CHANOBS*')))
+            self.chanobs = WrfHydroTs(self.chanobs)
 
         # Get Lakeout files
-        if len(list(current_dir.glob('*LAKEOUT*'))) > 0:
-            self.lakeout = WrfHydroTs(list(current_dir.glob('*LAKEOUT*')))
+        if len(list(sim_dir.glob('*LAKEOUT*'))) > 0:
+            self.lakeout = sort_files_by_time(list(sim_dir.glob('*LAKEOUT*')))
+            self.lakeout = WrfHydroTs(self.lakeout)
 
         # Get gwout files
-        if len(list(current_dir.glob('*GWOUT*'))) > 0:
-            self.gwout = WrfHydroTs(list(current_dir.glob('*GWOUT*')))
+        if len(list(sim_dir.glob('*GWOUT*'))) > 0:
+            self.gwout = sort_files_by_time(list(sim_dir.glob('*GWOUT*')))
+            self.gwout = WrfHydroTs(self.gwout)
+
+        # Get rtout files
+        if len(list(sim_dir.glob('*.RTOUT_*'))) > 0:
+            self.rtout = sort_files_by_time(list(sim_dir.glob('*.RTOUT_*')))
+            self.rtout = WrfHydroTs(self.rtout)
+
+        # Get ldasout files
+        if len(list(sim_dir.glob('*LDASOUT*'))) > 0:
+            if len(list(sim_dir.glob('*LDASOUT*'))) > 1:
+                # The [1:] in the next line is a side effect of NoahMP always
+                # outputting a file at t0.
+                self.ldasout = sort_files_by_time(list(sim_dir.glob('*LDASOUT*')))[1:]
+            else:
+                self.ldasout = sort_files_by_time(list(sim_dir.glob('*LDASOUT*')))
+
+            self.ldasout = WrfHydroTs(self.ldasout)
 
         # Get restart files and sort by modified time
         # Hydro restarts
         self.restart_hydro = []
-        for file in current_dir.glob('HYDRO_RST*'):
+        for file in sim_dir.glob('HYDRO_RST*'):
             file = WrfHydroStatic(file)
             self.restart_hydro.append(file)
 
         if len(self.restart_hydro) > 0:
-            self.restart_hydro = sorted(
-                self.restart_hydro,
-                key=lambda file: file.stat().st_mtime_ns
-            )
+            self.restart_hydro = sort_files_by_time(self.restart_hydro)
         else:
             self.restart_hydro = None
 
         # LSM Restarts
         self.restart_lsm = []
-        for file in current_dir.glob('RESTART*'):
+        for file in sim_dir.glob('RESTART*'):
             file = WrfHydroStatic(file)
             self.restart_lsm.append(file)
 
         if len(self.restart_lsm) > 0:
-            self.restart_lsm = sorted(
-                self.restart_lsm,
-                key=lambda file: file.stat().st_mtime_ns
-            )
+            self.restart_lsm = sort_files_by_time(self.restart_lsm)
         else:
             self.restart_lsm = None
 
         # Nudging restarts
         self.restart_nudging = []
-        for file in current_dir.glob('nudgingLastObs*'):
+        for file in sim_dir.glob('nudgingLastObs*'):
             file = WrfHydroStatic(file)
             self.restart_nudging.append(file)
 
         if len(self.restart_nudging) > 0:
-            self.restart_nudging = sorted(self.restart_nudging,
-                                          key=lambda file: file.stat().st_mtime_ns)
+            self.restart_nudging = sort_files_by_time(self.restart_nudging)
         else:
             self.restart_nudging = None
 
@@ -357,8 +449,8 @@ class SimulationOutput(object):
 
         # Loop over attributes
         for att in data_atts:
-            #Loop over files in each attribute
-            att_obj = getattr(self,att)
+            # Loop over files in each attribute
+            att_obj = getattr(self, att)
             if type(att_obj) is list or type(att_obj) is WrfHydroTs:
                 file = att_obj[-1]
                 na_check_result = check_file_nas(file)
@@ -371,5 +463,3 @@ class SimulationOutput(object):
             return pd.concat(df_list)
         else:
             return None
-
-

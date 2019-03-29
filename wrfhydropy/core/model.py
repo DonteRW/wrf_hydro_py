@@ -24,16 +24,16 @@ def get_git_revision_hash(the_dir: str) -> str:
     # First test if this is even a git repo. (Have to allow for this unless the wrfhydropy
     # testing brings in the wrf_hydro_code as a repo with a .git file.)
     dir_is_repo = subprocess.run(["git", "branch"],
-        stderr=subprocess.STDOUT,
-        stdout=open(os.devnull, 'w'),
-        cwd=str(the_dir.absolute()))
+                                 stderr=subprocess.STDOUT,
+                                 stdout=open(os.devnull, 'w'),
+                                 cwd=str(the_dir.absolute()))
     if dir_is_repo.returncode != 0:
         return 'could_not_get_hash'
 
     dirty = subprocess.run(['git', 'diff-index', 'HEAD'],  # --quiet seems to give the wrong result.
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=str(the_dir.absolute())).returncode
+                           stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE,
+                           cwd=str(the_dir.absolute())).returncode
     the_hash = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=str(the_dir.absolute()))
     the_hash = the_hash.decode('utf-8').split()[0]
     if dirty:
@@ -45,31 +45,37 @@ class Model(object):
     """Class for a WRF-Hydro model, which consitutes the model source code and compiled binary.
     """
 
-    def __init__(
-            self,
-            source_dir: str,
-            model_config: str,
-            compiler: str = 'gfort',
-            pre_compile_cmd: str = None,
-            compile_options: dict = None):
+    def __init__(self,
+                 source_dir: str,
+                 model_config: str,
+                 hydro_namelist_config_file: str=None,
+                 hrldas_namelist_config_file: str=None,
+                 compile_options_config_file: str=None,
+                 compiler: str = 'gfort',
+                 pre_compile_cmd: str = None,
+                 compile_options: dict = None):
         """Instantiate a Model object.
         Args:
             source_dir: Directory containing the source code, e.g.
                'wrf_hydro_nwm/trunk/NDHMS'.
             model_config: The configuration of the model. Used to match a model to a domain
-            configuration. Must be a key in both the *_namelists.json of in the source directory
-            and the *_namelist_patches.json in the domain directory.
+                configuration. Must be a key in both the *_namelists.json of in the source directory
+                and the *_namelist_patches.json in the domain directory.
             machine_spec: Optional dictionary of machine specification or string containing the
-            name of a known machine. Known machine names include 'cheyenne'. For an
-            example of a machine specification see the 'cheyenne' machine specification using
-            wrfhydropy.get_machine_spec('cheyenne').
+                name of a known machine. Known machine names include 'cheyenne'. For an
+                example of a machine specification see the 'cheyenne' machine specification using
+                wrfhydropy.get_machine_spec('cheyenne').
+            hydro_namelist_config_file: Path to a hydro namelist config file external to the model
+                repository. Default(None) implies using the model trunk/NDHMS/hydro_namelists.json.
+            hrldas_namelist_config_file: As for hydro_namelist_config_file, but for hrldas namelist.
+            compile_options_config_file: As for hydro_namelist_config_file, but for compile options.
             compiler: The compiler to use, must be one of 'pgi','gfort',
                 'ifort', or 'luna'.
             compile_options: Changes to default compile-time options.
         """
 
         # Instantiate all attributes and methods
-        ## Attributes set by init args
+        # Attributes set by init args
         self.source_dir = pathlib.Path(source_dir)
         """pathlib.Path: pathlib.Path object for source code directory."""
 
@@ -83,20 +89,42 @@ class Model(object):
         """str: Command string to be executed prior to model compilation, e.g. to load modules"""
 
         self.compile_options = dict()
-        """dict: Compile-time options. Defaults are loaded from json file stored with source 
+        """dict: Compile-time options. Defaults are loaded from json file stored with source
         code."""
 
-        ## Load master namelists
-        self.hydro_namelists = JSONNamelist(str(self.source_dir.joinpath('hydro_namelists.json')))
+        # Set nameilst config file defaults while allowing None to be passed.
+        self.hydro_namelist_config_file = hydro_namelist_config_file
+        """Namelist: Hydro namelist file specified for model config"""
+        self.hrldas_namelist_config_file = hrldas_namelist_config_file
+        """Namelist: HRLDAS namelist file specified for model config."""
+        self.compile_options_config_file = compile_options_config_file
+        """Namelist: Compile options file specified for model config."""
+
+        default_hydro_namelist_config_file = 'hydro_namelists.json'
+        default_hrldas_namelist_config_file = 'hrldas_namelists.json'
+        default_compile_options_config_file = 'compile_options.json'
+
+        if self.hydro_namelist_config_file is None:
+            self.hydro_namelist_config_file = default_hydro_namelist_config_file
+        if self.hrldas_namelist_config_file is None:
+            self.hrldas_namelist_config_file = default_hrldas_namelist_config_file
+        if self.compile_options_config_file is None:
+            self.compile_options_config_file = default_compile_options_config_file
+
+        # Load master namelists
+        self.hydro_namelists = JSONNamelist(
+            str(self.source_dir.joinpath(self.hydro_namelist_config_file))
+        )
         """Namelist: Hydro namelist for specified model config"""
         self.hydro_namelists = self.hydro_namelists.get_config(self.model_config)
 
-        self.hrldas_namelists = JSONNamelist(str(self.source_dir.joinpath('hrldas_namelists.json')))
+        self.hrldas_namelists = JSONNamelist(
+            str(self.source_dir.joinpath(self.hrldas_namelist_config_file))
+        )
         """Namelist: HRLDAS namelist for specified model config"""
         self.hrldas_namelists = self.hrldas_namelists.get_config(self.model_config)
 
-
-        ## Attributes set by other methods
+        # Attributes set by other methods
         self.compile_dir = None
         """pathlib.Path: pathlib.Path object pointing to the compile directory."""
 
@@ -124,29 +152,27 @@ class Model(object):
         self.wrf_hydro_exe = None
         """pathlib.Path: pathlib.Path to wrf_hydro.exe file generated at compile-time."""
 
-
         # Set attributes
-        ## Get code version
+        # Get code version
         with self.source_dir.joinpath('.version').open() as f:
             self.version = f.read()
 
-        ## Load compile options
-        compile_json = json.load(self.source_dir.joinpath('compile_options.json').open())
-        if 'nwm' in self.model_config:
-            compile_config = 'nwm'
-        else:
-            compile_config = self.model_config
+        # Load compile options
+        self.compile_options = JSONNamelist(
+            str(self.source_dir.joinpath(self.compile_options_config_file))
+        )
+        """Namelist: Hydro namelist for specified model config"""
+        self.compile_options = self.compile_options.get_config(self.model_config)
 
-        self.compile_options = compile_json[compile_config]
+        # "compile_options" is the argument to __init__
         if compile_options is not None:
             self.compile_options.update(compile_options)
 
         # Add compiler and compile options as attributes and update if needed
         self.compiler = compiler
 
-    def compile(
-            self,
-            compile_dir: pathlib.Path) -> str:
+    def compile(self,
+                compile_dir: pathlib.Path) -> str:
         """Compiles WRF-Hydro using specified compiler and compile options.
         Args:
             compile_dir: A non-existant directory to use for compilation.
@@ -155,8 +181,10 @@ class Model(object):
             attributes to WrfHydroModel
         """
 
-        self.compile_dir = pathlib.Path(compile_dir)
+        self.compile_dir = pathlib.Path(compile_dir).absolute()
 
+        self.modules = subprocess.run('module list', shell=True, stderr=subprocess.PIPE).stderr
+        
         # check compile directory.
         if not self.compile_dir.is_dir():
             warnings.warn(str(self.compile_dir.absolute()) + ' directory does not exist, creating')
@@ -186,11 +214,12 @@ class Model(object):
         compile_cmd += '"'
         compile_cmd = shlex.split(compile_cmd)
 
-        self.compile_log = subprocess.run(compile_cmd,
-                                          stdout=subprocess.PIPE,
-                                          stderr=subprocess.PIPE,
-                                          cwd=str(self.source_dir.absolute())
-                                          )
+        self.compile_log = subprocess.run(
+            compile_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(self.source_dir.absolute())
+        )
 
         # Add in unique ID file to match this object to prevent assosciating
         # this directory with another object
@@ -206,21 +235,20 @@ class Model(object):
             # Wrf hydro always puts files in source directory under a new directory called 'Run'
             # Copy files to the specified simulation directory if its not the same as the
             # source code directory
-            for file in self.source_dir.joinpath('Run').glob('*.TBL'):
-                shutil.copyfile(str(file), str(self.compile_dir.joinpath(file.name)))
+            if len(self.table_files) == 0:
+                self.table_files = list(self.source_dir.joinpath('Run').glob('*.TBL'))
 
             shutil.copyfile(str(self.source_dir.joinpath('Run').joinpath('wrf_hydro.exe')),
                             str(self.compile_dir.joinpath('wrf_hydro.exe')))
 
             # Remove old files
-            shutil.rmtree(str(self.source_dir.joinpath('Run')))
+            # shutil.rmtree(str(self.source_dir.joinpath('Run')))
 
             # Open permissions on copied compiled files
             subprocess.run(['chmod', '-R', '755', str(self.compile_dir)])
 
             # Get file lists as attributes
             # Get list of table file paths
-            self.table_files = list(self.compile_dir.glob('*.TBL'))
 
             # Get wrf_hydro.exe file path
             self.wrf_hydro_exe = self.compile_dir.joinpath('wrf_hydro.exe')
@@ -250,16 +278,6 @@ class Model(object):
         # Make directory if it does not exist.
         if not dest_dir.is_dir():
             dest_dir.mkdir(parents=True)
-
-        # Loop to make symlinks/copies for each TBL file
-        for from_file in self.table_files:
-            # Create file paths to symlink
-            to_file = dest_dir.joinpath(from_file.name)
-            # Create symlinks
-            if symlink:
-                to_file.symlink_to(from_file)
-            else:
-                shutil.copy(str(from_file),str(to_file))
 
         # Symlink/copy in exe
         from_file = self.wrf_hydro_exe

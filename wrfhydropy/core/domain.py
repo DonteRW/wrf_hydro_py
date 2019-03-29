@@ -40,11 +40,11 @@ class Domain(object):
         self.domain_config = domain_config.lower()
         """str: Specified configuration for which the domain is to be used, e.g. 'NWM_ana'"""
 
-        self._compatible_version = compatible_version
+        self.compatible_version = compatible_version
         """str: Source-code version for which the domain is to be used."""
 
         # Check .version file if compatible_version not specified
-        if self._compatible_version is None:
+        if self.compatible_version is None:
             try:
                 with self.domain_top_dir.joinpath('.version').open() as f:
                     self.compatible_version = f.read()
@@ -164,7 +164,8 @@ class Domain(object):
         # Symlink in nudging files
 
         # handling nudging obs files
-        if self.nudging_dir is not None:
+        # Users may signal "None" by the null string (''), treat them the same.
+        if not (self.nudging_dir is None or self.nudging_dir is ''):
             from_dir = self.nudging_dir
             to_dir = dest_dir.joinpath(from_dir.relative_to(self.domain_top_dir))
             if symlink:
